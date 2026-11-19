@@ -57,6 +57,16 @@ export class ConfigError extends HttpError {
   }
 }
 
+/**
+ * 503 — GitHub timed out or was unavailable even after retries. Transient, so
+ * the client is told to retry; the detail (path, status) goes to the log only.
+ */
+export class UpstreamUnavailableError extends HttpError {
+  constructor(message: string) {
+    super(503, `Upstream unavailable: ${message}`);
+  }
+}
+
 /** 502 — an upstream GitHub API call failed unexpectedly. */
 export class UpstreamError extends HttpError {
   constructor(message: string) {

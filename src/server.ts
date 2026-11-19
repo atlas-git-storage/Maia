@@ -27,7 +27,7 @@ import { EmbeddedSubtitles } from "./embeddedsubs.ts";
 import { findSubtitles } from "./subtitles.ts";
 import { decodeSegment, dirExists, listDir, normalizePath } from "./tree.ts";
 import { COOKIE_NAME, type Handler, tokensEqual, withAuth } from "./auth.ts";
-import { HttpError, NotFoundError, UpstreamError } from "./errors.ts";
+import { HttpError, NotFoundError, UpstreamError, UpstreamUnavailableError } from "./errors.ts";
 import { renderSnapshotList } from "./views/snapshots.ts";
 import { renderListing } from "./views/listing.ts";
 import { renderPlayer } from "./views/player.ts";
@@ -60,6 +60,14 @@ export function buildHandlerWithVault(authToken: string, vault: Vault): Deno.Ser
         // paths — log those server-side and return a generic body. Vault and
         // config errors describe the problem (and its fix) without secrets.
         if (e.status >= 500) console.error("vault error:", e.message);
+        if (e instanceof UpstreamUnavailableError) {
+          const res = text(
+            503,
+            "GitHub didn't respond in time (it may be busy). Try again in a minute.",
+          );
+          res.headers.set("Retry-After", "30");
+          return res;
+        }
         if (e instanceof UpstreamError) {
           return text(e.status, "Bad Gateway (GitHub request failed)");
         }

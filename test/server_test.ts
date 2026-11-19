@@ -362,3 +362,26 @@ Deno.test("the player polls embedded subtitles only for Matroska", async () => {
   const mp4 = await (await call(h, get("/snapaaaa/videos/clip.mp4?play", auth))).text();
   assertStringIncludes(mp4, `data-embedded=""`);
 });
+
+Deno.test("a GitHub timeout is a 503 asking to retry, with no upstream detail", async () => {
+  const built = buildMockVault("v", [{
+    id: "snapeeee",
+    name: "s",
+    files: [{ path: "a.txt", bytes: new TextEncoder().encode("a"), chunkSize: 8 }],
+  }]);
+  const { UpstreamUnavailableError } = await import("../src/errors.ts");
+  const client: GithubClient = {
+    ...built.client,
+    listChunkReleases: () =>
+      Promise.reject(
+        new UpstreamUnavailableError("GET /repos/secret-owner/Mobile/releases -> 504"),
+      ),
+  };
+  const h = buildHandlerWithVault(TOKEN, new Vault(client));
+  const res = await call(h, get("/snapeeee/a.txt", auth));
+  assertEquals(res.status, 503);
+  assertEquals(res.headers.get("retry-after"), "30");
+  const body = await res.text();
+  assertStringIncludes(body, "Try again");
+  assertEquals(body.includes("secret-owner"), false);
+});
