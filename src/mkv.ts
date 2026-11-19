@@ -510,10 +510,26 @@ export class SubtitleScanner {
 /** Longest cue kept, in bytes: a subtitle line is a sentence or two. */
 export const MAX_CUE_BYTES = 4096;
 
+/**
+ * Compressed input fed to the inflater per write. The inflater turns each
+ * write into output all at once, and deflate expands at most ~1032x, so this
+ * bounds any single output burst to ~256 KiB however big the block is.
+ */
+const INFLATE_SLICE = 256;
+
 /** zlib-inflate, stopping once `limit` bytes are out (no decompression bombs). */
 async function inflateCapped(data: Uint8Array, limit: number): Promise<Uint8Array> {
-  const reader = new Blob([new Uint8Array(data)]).stream()
-    .pipeThrough(new DecompressionStream("deflate")).getReader();
+  const inflater = new DecompressionStream("deflate");
+  const writer = inflater.writable.getWriter();
+  const reader = inflater.readable.getReader();
+  // Writes wait on reads (backpressure), so input only flows as fast as we
+  // consume output; once we stop reading, the remaining input is never inflated.
+  (async () => {
+    for (let i = 0; i < data.length; i += INFLATE_SLICE) {
+      await writer.write(data.slice(i, i + INFLATE_SLICE));
+    }
+    await writer.close();
+  })().catch(() => {});
   const out = new Uint8Array(limit);
   let n = 0;
   try {
@@ -526,6 +542,7 @@ async function inflateCapped(data: Uint8Array, limit: number): Promise<Uint8Arra
     }
   } finally {
     reader.cancel().catch(() => {});
+    writer.abort().catch(() => {});
   }
   return out.subarray(0, n);
 }
