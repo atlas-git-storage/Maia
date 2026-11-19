@@ -50,7 +50,8 @@ export function renderListing(
 <a class="name" href="${escapeAttr(linkTo(childPrefix))}">${escapeHtml(c.name)}/</a>
 </li>`;
     }
-    const href = linkTo(c.path!);
+    // Videos open in the player page (subtitle picker); everything else raw.
+    const href = linkTo(c.path!) + (isVideo(c.path!) ? "?play" : "");
     const size = c.size !== undefined ? `<span class="meta">${humanSize(c.size)}</span>` : "";
     let action = "";
     if (isVideo(c.path!)) {

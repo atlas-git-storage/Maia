@@ -57,7 +57,8 @@ Generate `AUTH_TOKEN` with e.g. `openssl rand -hex 32`.
 
 ## Auth
 
-Every endpoint is gated. A client may present `AUTH_TOKEN` three ways (preferred first):
+`GET /healthz` returns `ok` without auth (no vault or GitHub access) — point Render's health check
+at it. Every other endpoint is gated. A client may present `AUTH_TOKEN` three ways (preferred first):
 
 1. `Authorization: Bearer <token>` — for curl/VLC.
 2. `Cookie: maia_token=<token>` — set automatically when you open any `?token=<token>` URL in a
@@ -65,6 +66,27 @@ Every endpoint is gated. A client may present `AUTH_TOKEN` three ways (preferred
    the address bar or history. Page links never carry the token.
 3. `?token=<token>` — a single pasteable URL. The **copy URL** button next to a video produces
    exactly this so you can paste it into VLC.
+
+### Subtitles in the browser
+
+Tapping a video opens a player page (`/<snap>/<video>?play`) with a **Subtitles** menu.
+
+**In video** — text subtitle tracks embedded in MKV/WebM (SRT, ASS, WebVTT). Browsers drop these
+tracks, so Maia picks them up itself: subtitle lines sit between the video/audio data in the file,
+and as Maia streams the video to the browser it scans those bytes for them (only element
+headers are read; video payloads are skipped). The page polls `?subtitles` every 2 s while
+playing. The browser buffers ahead, so lines arrive before they're due; after a seek they resume
+from the new position. Nothing extra is downloaded from GitHub. Image tracks (PGS/VobSub) are
+listed but need VLC; ASS styling is dropped.
+
+**Files in the vault** — matched by name:
+
+- `Movie.srt`, `Movie.en.srt`, `Movie.forced.en.vtt` next to `Movie.mkv`
+- a `Subs/` folder next to the video: everything in it if the video is alone in its directory,
+  otherwise `Subs/<video name>/…` or `Subs/<video name>.*`
+
+**load file…** adds an `.srt`/`.vtt` from your device; it's parsed in the page and never uploaded.
+For image subtitles, styled ASS, or subtitles inside MP4, use the **copy URL** button and VLC.
 
 > The URL + token _is_ the vault in plaintext. The `GITHUB_TOKEN` and `ATLAS_VAULT_SECRET` are
 > server-side only and never reach the browser. The vault secret is the master key to the whole

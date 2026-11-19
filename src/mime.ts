@@ -57,3 +57,16 @@ export function contentType(path: string): string {
 export function isVideo(path: string): boolean {
   return VIDEO_EXTS.has(extOf(path));
 }
+
+/** Matroska container (MKV/WebM): the only one whose embedded subtitles maia extracts. */
+export function isMatroska(path: string): boolean {
+  const ext = extOf(path);
+  return ext === "mkv" || ext === "webm";
+}
+
+/** Text subtitle formats the browser player can parse (SRT, WebVTT). */
+const SUBTITLE_EXTS = new Set(["srt", "vtt"]);
+
+export function isSubtitle(path: string): boolean {
+  return SUBTITLE_EXTS.has(extOf(path));
+}

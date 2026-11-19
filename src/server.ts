@@ -1,11 +1,18 @@
 /**
  * HTTP server: routing, auth wrapping, and error→Response mapping.
  *
+ * GET /healthz is answered before auth: it says the process is up and touches
+ * neither GitHub nor the vault, so a platform health checker can poll it freely.
+ *
  * Routes (all behind withAuth):
  *   GET /                      -> snapshot list (HTML, or JSON if Accept: json)
  *   GET /<snap>/               -> directory listing of a snapshot
  *   GET /<snap>/<dir>/         -> directory listing of a subdir
  *   GET /<snap>/<path>         -> stream a file (Range-aware)
+ *   GET /<snap>/<video>?play   -> player page with a subtitle picker
+ *   GET /<snap>/<video>?subtitles&after=N
+ *                              -> embedded MKV subtitle tracks + cues found so
+ *                                 far by streaming (JSON, polled by the player)
  *
  * The whole router is wrapped once in withAuth, so every route is gated.
  */
@@ -15,12 +22,15 @@ import { createGithubClient } from "./github.ts";
 import { Vault } from "./vault.ts";
 import { planRange, rangeStream } from "./reconstruct.ts";
 import { parseRange } from "./range.ts";
-import { contentType } from "./mime.ts";
+import { contentType, isMatroska, isVideo } from "./mime.ts";
+import { EmbeddedSubtitles } from "./embeddedsubs.ts";
+import { findSubtitles } from "./subtitles.ts";
 import { decodeSegment, dirExists, listDir, normalizePath } from "./tree.ts";
 import { COOKIE_NAME, type Handler, tokensEqual, withAuth } from "./auth.ts";
 import { HttpError, NotFoundError, UpstreamError } from "./errors.ts";
 import { renderSnapshotList } from "./views/snapshots.ts";
 import { renderListing } from "./views/listing.ts";
+import { renderPlayer } from "./views/player.ts";
 
 export function buildHandler(config: Config): Deno.ServeHandler {
   const client = createGithubClient({
@@ -37,12 +47,13 @@ export function buildHandler(config: Config): Deno.ServeHandler {
 
 /** Build the handler around an already-constructed Vault (used by tests). */
 export function buildHandlerWithVault(authToken: string, vault: Vault): Deno.ServeHandler {
+  const subs = new EmbeddedSubtitles(vault);
   const router: Handler = async (req) => {
     if (req.method !== "GET" && req.method !== "HEAD") {
       return text(405, "Method Not Allowed");
     }
     try {
-      return await route(vault, req, authToken);
+      return await route(vault, subs, req, authToken);
     } catch (e) {
       if (e instanceof HttpError) {
         // Upstream messages can carry GitHub error snippets and owner/repo
@@ -61,7 +72,10 @@ export function buildHandlerWithVault(authToken: string, vault: Vault): Deno.Ser
 
   const guarded = withAuth(authToken, router);
   const withBootstrap = withCookieBootstrap(authToken, guarded);
-  return (req, _info) => withBootstrap(req);
+  return (req, _info) => {
+    if (new URL(req.url).pathname === "/healthz") return text(200, "ok");
+    return withBootstrap(req);
+  };
 }
 
 /**
@@ -124,7 +138,12 @@ function isBrowserNavigation(req: Request): boolean {
   return (req.headers.get("accept") ?? "").includes("text/html");
 }
 
-async function route(vault: Vault, req: Request, authToken: string): Promise<Response> {
+async function route(
+  vault: Vault,
+  subs: EmbeddedSubtitles,
+  req: Request,
+  authToken: string,
+): Promise<Response> {
   const url = new URL(req.url);
 
   // Split path into segments, dropping empties.
@@ -193,7 +212,22 @@ async function route(vault: Vault, req: Request, authToken: string): Promise<Res
   }
 
   if (!entry) throw new NotFoundError(`path '${path}' not found in snapshot`);
-  return await streamFile(vault, req, entry.c, entry.s, contentType(path));
+  if (url.searchParams.has("play") && isVideo(path)) {
+    return html(
+      200,
+      renderPlayer(snap, path, findSubtitles(manifest.entries, path), isMatroska(path)),
+    );
+  }
+  const subsKey = `${snap.id}/${path}`;
+  if (url.searchParams.has("subtitles")) {
+    if (!isMatroska(path)) return json(200, { tracks: [], cues: [], next: 0 });
+    const after = Number(url.searchParams.get("after")) || 0;
+    return json(200, await subs.poll(subsKey, entry, after));
+  }
+  const tee = isMatroska(path)
+    ? (body: ReadableStream<Uint8Array>) => subs.tee(subsKey, entry, body)
+    : undefined;
+  return await streamFile(vault, req, entry.c, entry.s, contentType(path), tee);
 }
 
 async function streamFile(
@@ -202,6 +236,8 @@ async function streamFile(
   chunks: import("./types.ts").ChunkRef[],
   size: number,
   ctype: string,
+  /** Observe the body as it streams (embedded subtitle collection). */
+  tee?: (body: ReadableStream<Uint8Array>) => Promise<ReadableStream<Uint8Array>>,
 ): Promise<Response> {
   const range = parseRange(req.headers.get("range"), size);
 
@@ -244,7 +280,8 @@ async function streamFile(
   }
 
   const pieces = await planRange(vault, chunks, size, start, end);
-  return new Response(rangeStream(vault, pieces), { status, headers });
+  const body = rangeStream(vault, pieces);
+  return new Response(tee ? await tee(body) : body, { status, headers });
 }
 
 // ---- response helpers ----
@@ -272,10 +309,11 @@ function html(status: number, body: string): Response {
       "Content-Type": "text/html; charset=utf-8",
       "Cache-Control": "private, no-store",
       "X-Content-Type-Options": "nosniff",
-      // Our HTML uses one tiny inline <script> (the copy-URL button) and inline
-      // CSS; allow those but nothing external. No object/base; restrict to self.
+      // Our HTML uses small inline <script>s (copy-URL button, subtitle
+      // loader) and inline CSS; allow those but nothing external. connect-src
+      // lets the player fetch sidecar subtitles from this origin only.
       "Content-Security-Policy":
-        "default-src 'none'; img-src 'self'; media-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
+        "default-src 'none'; img-src 'self'; media-src 'self'; connect-src 'self'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
     },
   });
 }

@@ -16,6 +16,16 @@ function makeHandler() {
     files: [
       { path: "photos/cat.jpg", bytes: new TextEncoder().encode("JPEGDATA"), chunkSize: 4 },
       { path: "videos/clip.mp4", bytes: bigFile, chunkSize: 32 },
+      {
+        path: "videos/clip.en.srt",
+        bytes: new TextEncoder().encode("1\n00:00:01,000 --> 00:00:02,000\nhi\n"),
+        chunkSize: 16,
+      },
+      {
+        path: "videos/subs.mkv",
+        bytes: Deno.readFileSync(new URL("./fixture/subs.mkv", import.meta.url)),
+        chunkSize: 500,
+      },
       { path: "notes.txt", bytes: new TextEncoder().encode("hello world"), chunkSize: 5 },
     ],
     manifestChunkSize: 50,
@@ -249,9 +259,10 @@ Deno.test("VLC-style ?token= request is served directly (no redirect)", async ()
 Deno.test("listing links carry no token; only the video copy-URL does", async () => {
   const h = makeHandler();
   const page = await (await call(h, get("/snapaaaa/videos/", auth))).text();
-  assertStringIncludes(page, `href="/snapaaaa/videos/clip.mp4"`);
+  assertStringIncludes(page, `href="/snapaaaa/videos/clip.mp4?play"`);
   assertStringIncludes(page, `data-url="http://maia.test/snapaaaa/videos/clip.mp4?token=${TOKEN}"`);
-  assertEquals(page.match(/token=/g)?.length, 1);
+  // One copy-URL per video (clip.mp4, subs.mkv), nothing else.
+  assertEquals(page.match(/token=/g)?.length, 2);
 });
 
 Deno.test("a sealed vault without ATLAS_VAULT_SECRET says so (not a bare Bad Gateway)", async () => {
@@ -283,4 +294,71 @@ Deno.test("upstream GitHub failures stay masked", async () => {
   const body = await res.text();
   assertStringIncludes(body, "Bad Gateway");
   assertEquals(body.includes("secret-owner"), false);
+});
+
+Deno.test("?play on a video serves a player listing its sidecar subtitles", async () => {
+  const h = makeHandler();
+  const res = await call(h, get("/snapaaaa/videos/clip.mp4?play", auth));
+  assertEquals(res.status, 200);
+  assertStringIncludes(res.headers.get("content-security-policy")!, "connect-src 'self'");
+  const body = await res.text();
+  assertStringIncludes(body, `src="/snapaaaa/videos/clip.mp4"`);
+  assertStringIncludes(body, `<option value="/snapaaaa/videos/clip.en.srt">en</option>`);
+
+  const listing = await (await call(h, get("/snapaaaa/videos/", auth))).text();
+  assertStringIncludes(listing, `href="/snapaaaa/videos/clip.mp4?play"`);
+  // ?play on a non-video is just the file.
+  assertEquals(
+    (await call(h, get("/snapaaaa/notes.txt?play", auth))).headers.get("content-type"),
+    "text/plain; charset=utf-8",
+  );
+});
+
+Deno.test("/healthz answers without auth and reveals nothing", async () => {
+  const h = makeHandler();
+  const res = await call(h, get("/healthz"));
+  assertEquals(res.status, 200);
+  assertEquals(await res.text(), "ok\n");
+  assertEquals(res.headers.get("set-cookie"), null);
+});
+
+Deno.test("embedded MKV subtitles are collected from the video stream and polled", async () => {
+  const h = makeHandler();
+  const poll = async (after: number) =>
+    await (await call(h, get(`/snapaaaa/videos/subs.mkv?subtitles&after=${after}`, auth)))
+      .json() as {
+        tracks: Array<{ number: number; language: string; text: boolean }>;
+        cues: Array<{ track: number; start: number; end: number; text: string }>;
+        next: number;
+      };
+  const before = await poll(0);
+  assertEquals(before.tracks.map((t) => [t.number, t.language, t.text]), [[2, "eng", true], [
+    3,
+    "fre",
+    true,
+  ]]);
+  assertEquals(before.cues, []);
+
+  // Play the video: the streamed bytes must be untouched.
+  const res = await call(h, get("/snapaaaa/videos/subs.mkv", auth));
+  const bytes = new Uint8Array(await res.arrayBuffer());
+  assertEquals(bytes, Deno.readFileSync(new URL("./fixture/subs.mkv", import.meta.url)));
+  await new Promise((r) => setTimeout(r, 0)); // cue text decoding is async
+
+  const after = await poll(0);
+  assertEquals(after.cues.length, 5);
+  assertEquals(after.cues.find((c) => c.start === 7000)?.text, "Late cue");
+  assertEquals((await poll(after.next)).cues, []);
+  // A second play adds no duplicates.
+  await (await call(h, get("/snapaaaa/videos/subs.mkv", auth))).arrayBuffer();
+  await new Promise((r) => setTimeout(r, 0));
+  assertEquals((await poll(0)).cues.length, 5);
+});
+
+Deno.test("the player polls embedded subtitles only for Matroska", async () => {
+  const h = makeHandler();
+  const mkv = await (await call(h, get("/snapaaaa/videos/subs.mkv?play", auth))).text();
+  assertStringIncludes(mkv, `data-embedded="/snapaaaa/videos/subs.mkv?subtitles"`);
+  const mp4 = await (await call(h, get("/snapaaaa/videos/clip.mp4?play", auth))).text();
+  assertStringIncludes(mp4, `data-embedded=""`);
 });

@@ -23,6 +23,9 @@ li .meta { opacity: .6; font-size: .85rem; white-space: nowrap; }
 .dir::before { content: "📁 "; }
 .file::before { content: "📄 "; }
 button { font: inherit; padding: .2rem .5rem; cursor: pointer; }
+.subs { display: flex; flex-wrap: wrap; gap: .75rem; align-items: center; }
+.subs select, .subs .load { font: inherit; }
+.subs .load { text-decoration: underline; cursor: pointer; }
 </style>
 </head>
 <body>
