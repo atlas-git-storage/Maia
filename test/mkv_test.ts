@@ -1,6 +1,7 @@
 import { assert, assertEquals } from "@std/assert";
 import {
   cueText,
+  MAX_CUE_BYTES,
   type MkvHeader,
   type RawCue,
   readMkvHeader,
@@ -96,4 +97,24 @@ Deno.test("zlib-compressed and header-stripped tracks decode", async () => {
     await cueText({ ...base, compression: { algo: 3, settings: text.slice(0, 5) } }, text.slice(5)),
     "compressed line",
   );
+});
+
+Deno.test("cue text is capped, even from a zlib bomb", async () => {
+  const huge = new Uint8Array(10 << 20).fill(0x41); // 10 MiB of "A", ~10 KB compressed
+  const z = new Uint8Array(
+    await new Response(new Blob([huge]).stream().pipeThrough(new CompressionStream("deflate")))
+      .arrayBuffer(),
+  );
+  const base = {
+    number: 2,
+    codec: "S_TEXT/UTF8",
+    language: "eng",
+    name: "",
+    default: true,
+    forced: false,
+    text: true,
+  };
+  const text = await cueText({ ...base, compression: { algo: 0, settings: new Uint8Array() } }, z);
+  assertEquals(text.length, MAX_CUE_BYTES);
+  assertEquals((await cueText(base, huge)).length, MAX_CUE_BYTES);
 });
