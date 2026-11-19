@@ -39,19 +39,21 @@ interface FileSubs {
   header: Promise<MkvHeader | null>;
   cues: Cue[];
   seen: Set<string>;
-  /** Text bytes stored (UTF-16 length, close enough for a budget). */
+  /** Approximate memory held by this file's cues (text is stored twice: cue + key). */
   bytes: number;
 }
 
 /** Files whose cues are kept (LRU). Text is small: a film is ~100 KB per track. */
 const MAX_FILES = 16;
 /**
- * Per-file text budget. A film's full subtitles are ~100 KB per track, so this
- * fits ~20 tracks; past it, further cues are dropped (bounds memory at
- * MAX_FILES × this, whatever the file contains). Cue text itself is capped at
- * MAX_CUE_BYTES by cueText().
+ * Per-file memory budget for cues. A film track is ~1500 cues ≈ 350 KB by
+ * this accounting, so this fits ~10 tracks; past it, further cues are dropped.
+ * Bounds memory at MAX_FILES × this (64 MiB), whatever the files contain. Cue
+ * text itself is capped at MAX_CUE_BYTES by cueText().
  */
-const MAX_TEXT_PER_FILE = 2 << 20;
+const MAX_TEXT_PER_FILE = 4 << 20;
+/** Approximate bytes per stored cue beyond its text. */
+const CUE_OVERHEAD = 128;
 
 export class EmbeddedSubtitles {
   #reader: ChunkReader;
@@ -116,13 +118,16 @@ export class EmbeddedSubtitles {
   }
 
   #add(file: FileSubs, cue: Cue): void {
-    if (file.bytes + cue.text.length > MAX_TEXT_PER_FILE) return;
+    // Charge per-cue overhead too (object, dedup key, JSON), so a flood of
+    // tiny cues can't slip past a budget that only counted their text.
+    const cost = cue.text.length * 2 + CUE_OVERHEAD;
+    if (file.bytes + cost > MAX_TEXT_PER_FILE) return;
     // Overlapping range requests scan the same clusters; keep each cue once.
     const id = `${cue.track}:${cue.start}:${cue.text}`;
     if (file.seen.has(id)) return;
     file.seen.add(id);
     file.cues.push(cue);
-    file.bytes += cue.text.length;
+    file.bytes += cost;
   }
 
   #file(key: string, entry: ManifestEntry): FileSubs {
