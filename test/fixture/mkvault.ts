@@ -13,6 +13,9 @@
 import { chacha20poly1305 } from "@noble/ciphers/chacha.js";
 import { blake3 } from "@noble/hashes/blake3.js";
 import { encodeHex } from "@std/encoding/hex";
+import { encodeBase64 } from "@std/encoding/base64";
+import { hkdf } from "@noble/hashes/hkdf.js";
+import { sha256 } from "@noble/hashes/sha2.js";
 import { encode as msgpackEncode } from "@msgpack/msgpack";
 import { ROOT_MARKER } from "../../src/rootdoc.ts";
 import type { GithubClient, Release, ReleaseAsset } from "../../src/github.ts";
@@ -36,6 +39,11 @@ export interface MockSnapshotSpec {
   files: MockFile[];
   /** Chunk size for the serialized manifest itself. */
   manifestChunkSize?: number;
+}
+
+export interface MockVaultOptions {
+  /** Seal manifest pointers under this 32-byte secret, as atlas >= 0.2.0 does. */
+  sealWith?: Uint8Array;
 }
 
 export interface MockVault {
@@ -72,6 +80,7 @@ function splitChunks(bytes: Uint8Array, chunkSize: number): Uint8Array[] {
 export function buildMockVault(
   vaultId: string,
   snapshots: MockSnapshotSpec[],
+  opts: MockVaultOptions = {},
 ): MockVault {
   const assets = new Map<string, Uint8Array>();
   const record = (b: BuiltAsset) => {
@@ -100,7 +109,10 @@ export function buildMockVault(
       spec.manifestChunkSize ?? Math.max(1, manifestBytes.length),
     ).map((pt) => record(encryptChunk(pt)));
     const pointerPairs = manifestPieces.map((b) => [b.cidHex, encodeHex(b.key)]);
-    const pointer = JSON.stringify(pointerPairs);
+    const plainPointer = JSON.stringify(pointerPairs);
+    const pointer = opts.sealWith
+      ? sealPointer(opts.sealWith, plainPointer, vaultId, "snapshot-manifest")
+      : plainPointer;
 
     return {
       id: spec.id,
@@ -132,7 +144,7 @@ export function buildMockVault(
     const releaseId = 1 + Math.floor(idx / 3); // ~3 assets per release
     const tag = `atlas-chunk-${vaultId}-${String(releaseId).padStart(6, "0")}`;
     if (!assetsByRelease.has(releaseId)) {
-      releases.push({ id: releaseId, tag_name: tag });
+      releases.push({ id: releaseId, tag_name: tag, empty: false });
       assetsByRelease.set(releaseId, []);
     }
     const assetId = nextAssetId++;
@@ -164,4 +176,27 @@ function hexToBytes(hex: string): Uint8Array {
   const out = new Uint8Array(hex.length / 2);
   for (let i = 0; i < out.length; i++) out[i] = parseInt(hex.slice(i * 2, i * 2 + 2), 16);
   return out;
+}
+
+/** Mirror of atlas `crypto.seal_pointer` (random nonce, HKDF key, vault/field AAD). */
+export function sealPointer(
+  secret: Uint8Array,
+  pointer: string,
+  vaultId: string,
+  field: string,
+): string {
+  const key = hkdf(
+    sha256,
+    secret,
+    undefined,
+    new TextEncoder().encode("atlas/root-pointer/v1"),
+    32,
+  );
+  const nonce = crypto.getRandomValues(new Uint8Array(12));
+  const aad = new TextEncoder().encode(`atlas-pointer|${vaultId}|${field}`);
+  const ct = chacha20poly1305(key, nonce, aad).encrypt(new TextEncoder().encode(pointer));
+  const out = new Uint8Array(nonce.length + ct.length);
+  out.set(nonce);
+  out.set(ct, nonce.length);
+  return "sealed1:" + encodeBase64(out);
 }

@@ -6,13 +6,15 @@
  *
  *   MAIA_E2E=1 \
  *   GITHUB_OWNER=... GITHUB_REPO=... ATLAS_VAULT_ID=... GITHUB_TOKEN=... \
+ *   [ATLAS_VAULT_SECRET=...  # needed for vaults written by atlas >= 0.2.0] \
  *   deno test --allow-net --allow-env test/e2e_test.ts
  */
 
 import { assert, assertEquals } from "@std/assert";
 import { createGithubClient } from "../src/github.ts";
 import { Vault } from "../src/vault.ts";
-import { rangeStream } from "../src/reconstruct.ts";
+import { planRange, rangeStream } from "../src/reconstruct.ts";
+import { parseVaultSecret } from "../src/crypto.ts";
 
 const enabled = Deno.env.get("MAIA_E2E") === "1";
 
@@ -25,7 +27,11 @@ Deno.test({
     const vaultId = required("ATLAS_VAULT_ID");
     const token = required("GITHUB_TOKEN");
 
-    const vault = new Vault(createGithubClient({ owner, repo, vaultId, token }));
+    const secret = Deno.env.get("ATLAS_VAULT_SECRET");
+    const vault = new Vault(
+      createGithubClient({ owner, repo, vaultId, token }),
+      secret ? { vaultId, secret: parseVaultSecret(secret) } : undefined,
+    );
 
     const snaps = await vault.listSnapshots();
     assert(snaps.length > 0, "expected at least one snapshot");
@@ -43,12 +49,16 @@ Deno.test({
     console.log(`smallest file: ${small.p} (${small.s} bytes, ${small.c.length} chunks)`);
 
     // Full read: byte count must equal the authoritative size.
-    const full = await collect(rangeStream(vault, small.c, 0, small.s - 1));
+    const full = await collect(
+      rangeStream(vault, await planRange(vault, small.c, small.s, 0, small.s - 1)),
+    );
     assertEquals(full.length, small.s, "full read length must equal s");
 
     // Range read: first 16 bytes (or the whole file if smaller) must match.
     const end = Math.min(15, small.s - 1);
-    const part = await collect(rangeStream(vault, small.c, 0, end));
+    const part = await collect(
+      rangeStream(vault, await planRange(vault, small.c, small.s, 0, end)),
+    );
     assertEquals(part, full.slice(0, end + 1), "range slice must match the full read");
   },
 });

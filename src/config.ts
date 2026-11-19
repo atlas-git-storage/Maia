@@ -3,6 +3,8 @@
  * Fails fast with a clear message if a required secret is missing.
  */
 
+import { parseVaultSecret } from "./crypto.ts";
+
 export interface Config {
   owner: string;
   repo: string;
@@ -11,6 +13,12 @@ export interface Config {
   githubToken: string;
   /** Bearer token clients must present on every request. */
   authToken: string;
+  /**
+   * Raw 32-byte atlas vault secret, needed to open the sealed ROOT pointers
+   * written by atlas >= 0.2.0. Optional: vaults written only by older atlas
+   * versions keep plaintext pointers and are readable without it.
+   */
+  vaultSecret?: Uint8Array;
   port: number;
 }
 
@@ -52,11 +60,21 @@ export function loadConfig(env: { get(key: string): string | undefined } = Deno.
     throw new Error("AUTH_TOKEN must be at least 16 characters (use e.g. `openssl rand -hex 32`).");
   }
 
+  const secretRaw = env.get("ATLAS_VAULT_SECRET")?.trim();
+  let vaultSecret: Uint8Array | undefined;
+  if (secretRaw) {
+    try {
+      vaultSecret = parseVaultSecret(secretRaw);
+    } catch (e) {
+      throw new Error(`ATLAS_VAULT_SECRET: ${(e as Error).message}`);
+    }
+  }
+
   const portRaw = env.get("PORT")?.trim();
   const port = portRaw ? Number(portRaw) : 8000;
   if (!Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error(`PORT must be an integer in 1..65535, got ${portRaw}`);
   }
 
-  return { owner, repo, vaultId, githubToken, authToken, port };
+  return { owner, repo, vaultId, githubToken, authToken, vaultSecret, port };
 }
