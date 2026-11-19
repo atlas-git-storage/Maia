@@ -1,5 +1,6 @@
 import { assertEquals, assertStringIncludes } from "@std/assert";
 import { buildMockVault } from "./fixture/mkvault.ts";
+import type { GithubClient } from "../src/github.ts";
 import { Vault } from "../src/vault.ts";
 import { buildHandlerWithVault } from "../src/server.ts";
 
@@ -164,7 +165,7 @@ Deno.test("query-token auth sets a cookie on a 2xx response", async () => {
   assertStringIncludes(setCookie, "maia_token=");
   assertStringIncludes(setCookie, "HttpOnly");
   assertStringIncludes(setCookie, "Secure");
-  assertStringIncludes(setCookie, "SameSite=Strict");
+  assertStringIncludes(setCookie, "SameSite=Lax");
   await res.body?.cancel();
 });
 
@@ -216,4 +217,70 @@ Deno.test("a stale cookie does not block a valid ?token=, and the cookie is refr
   assertEquals(res.status, 200); // valid query token wins over the stale cookie
   assertStringIncludes(res.headers.get("set-cookie") ?? "", "maia_token="); // refreshed
   await res.body?.cancel();
+});
+
+Deno.test("browser navigation with ?token= sets the cookie and redirects the token away", async () => {
+  const h = makeHandler();
+  const res = await call(
+    h,
+    get(`/snapaaaa/photos/?token=${TOKEN}&x=1`, { "sec-fetch-mode": "navigate" }),
+  );
+  assertEquals(res.status, 303);
+  assertEquals(res.headers.get("location"), "/snapaaaa/photos/?x=1");
+  assertEquals(res.headers.get("cache-control"), "no-store");
+  assertStringIncludes(res.headers.get("set-cookie") ?? "", "maia_token=");
+});
+
+Deno.test("browser navigation with a WRONG ?token= is not redirected or cookied", async () => {
+  const h = makeHandler();
+  const res = await call(h, get(`/?token=wrong-token-totally-invalid`, { accept: "text/html" }));
+  assertEquals(res.status, 401);
+  assertEquals(res.headers.get("set-cookie"), null);
+  await res.body?.cancel();
+});
+
+Deno.test("VLC-style ?token= request is served directly (no redirect)", async () => {
+  const h = makeHandler();
+  const res = await call(h, get(`/snapaaaa/notes.txt?token=${TOKEN}`, { accept: "*/*" }));
+  assertEquals(res.status, 200);
+  assertEquals(await res.text(), "hello world");
+});
+
+Deno.test("listing links carry no token; only the video copy-URL does", async () => {
+  const h = makeHandler();
+  const page = await (await call(h, get("/snapaaaa/videos/", auth))).text();
+  assertStringIncludes(page, `href="/snapaaaa/videos/clip.mp4"`);
+  assertStringIncludes(page, `data-url="http://maia.test/snapaaaa/videos/clip.mp4?token=${TOKEN}"`);
+  assertEquals(page.match(/token=/g)?.length, 1);
+});
+
+Deno.test("a sealed vault without ATLAS_VAULT_SECRET says so (not a bare Bad Gateway)", async () => {
+  const built = buildMockVault("v", [{
+    id: "snapcccc",
+    name: "s",
+    files: [{ path: "a.txt", bytes: new TextEncoder().encode("a"), chunkSize: 8 }],
+  }], { sealWith: new Uint8Array(32) });
+  const h = buildHandlerWithVault(TOKEN, new Vault(built.client));
+  const res = await call(h, get("/snapcccc/", auth));
+  assertEquals(res.status, 500);
+  assertStringIncludes(await res.text(), "set ATLAS_VAULT_SECRET");
+});
+
+Deno.test("upstream GitHub failures stay masked", async () => {
+  const built = buildMockVault("v", [{
+    id: "snapdddd",
+    name: "s",
+    files: [{ path: "a.txt", bytes: new TextEncoder().encode("a"), chunkSize: 8 }],
+  }]);
+  const { UpstreamError } = await import("../src/errors.ts");
+  const client: GithubClient = {
+    ...built.client,
+    listChunkReleases: () => Promise.reject(new UpstreamError("secret-owner/secret-repo 403")),
+  };
+  const h = buildHandlerWithVault(TOKEN, new Vault(client));
+  const res = await call(h, get("/snapdddd/", auth));
+  assertEquals(res.status, 502);
+  const body = await res.text();
+  assertStringIncludes(body, "Bad Gateway");
+  assertEquals(body.includes("secret-owner"), false);
 });

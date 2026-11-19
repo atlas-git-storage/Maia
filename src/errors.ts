@@ -46,6 +46,17 @@ export class BadVaultError extends HttpError {
   }
 }
 
+/**
+ * 500 — the deployment is misconfigured (e.g. a sealed vault but no
+ * ATLAS_VAULT_SECRET). The message names the fix and holds nothing secret,
+ * so it is shown to the (already authenticated) client.
+ */
+export class ConfigError extends HttpError {
+  constructor(message: string) {
+    super(500, `Server misconfigured: ${message}`);
+  }
+}
+
 /** 502 — an upstream GitHub API call failed unexpectedly. */
 export class UpstreamError extends HttpError {
   constructor(message: string) {

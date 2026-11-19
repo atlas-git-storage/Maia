@@ -60,8 +60,9 @@ Generate `AUTH_TOKEN` with e.g. `openssl rand -hex 32`.
 Every endpoint is gated. A client may present `AUTH_TOKEN` three ways (preferred first):
 
 1. `Authorization: Bearer <token>` — for curl/VLC.
-2. `Cookie: maia_token=<token>` — set automatically the first time you open `/?token=<token>` in a
-   browser, so later navigations and inline image/PDF loads work without the token in every URL.
+2. `Cookie: maia_token=<token>` — set automatically when you open any `?token=<token>` URL in a
+   browser, which is then redirected (303) to the same URL without the token, so it never stays in
+   the address bar or history. Page links never carry the token.
 3. `?token=<token>` — a single pasteable URL. The **copy URL** button next to a video produces
    exactly this so you can paste it into VLC.
 
