@@ -39,11 +39,19 @@ interface FileSubs {
   header: Promise<MkvHeader | null>;
   cues: Cue[];
   seen: Set<string>;
+  /** Text bytes stored (UTF-16 length, close enough for a budget). */
+  bytes: number;
 }
 
 /** Files whose cues are kept (LRU). Text is small: a film is ~100 KB per track. */
 const MAX_FILES = 16;
-const MAX_CUES_PER_FILE = 100_000;
+/**
+ * Per-file text budget. A film's full subtitles are ~100 KB per track, so this
+ * fits ~20 tracks; past it, further cues are dropped (bounds memory at
+ * MAX_FILES × this, whatever the file contains). Cue text itself is capped at
+ * MAX_CUE_BYTES by cueText().
+ */
+const MAX_TEXT_PER_FILE = 2 << 20;
 
 export class EmbeddedSubtitles {
   #reader: ChunkReader;
@@ -108,12 +116,13 @@ export class EmbeddedSubtitles {
   }
 
   #add(file: FileSubs, cue: Cue): void {
-    if (file.cues.length >= MAX_CUES_PER_FILE) return;
+    if (file.bytes + cue.text.length > MAX_TEXT_PER_FILE) return;
     // Overlapping range requests scan the same clusters; keep each cue once.
     const id = `${cue.track}:${cue.start}:${cue.text}`;
     if (file.seen.has(id)) return;
     file.seen.add(id);
     file.cues.push(cue);
+    file.bytes += cue.text.length;
   }
 
   #file(key: string, entry: ManifestEntry): FileSubs {
@@ -127,6 +136,7 @@ export class EmbeddedSubtitles {
       header: readMkvHeader((offset, len) => this.#readAt(entry, offset, len), entry.s),
       cues: [],
       seen: new Set(),
+      bytes: 0,
     };
     // A transient GitHub failure must not stick: forget the file so the next
     // request retries the header.

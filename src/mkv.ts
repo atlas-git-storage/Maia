@@ -434,6 +434,11 @@ export class SubtitleScanner {
         continue;
       }
       if (h.id === ID.Timestamp || h.id === ID.BlockDuration) {
+        if (h.size > 8) {
+          // An integer can't be this long: corrupt. Skip it rather than buffer it.
+          this.#advance(h.headerLen + h.size);
+          continue;
+        }
         if (body + h.size > b.length) return;
         const v = readUint(b.subarray(body, body + h.size));
         if (h.id === ID.Timestamp) this.#clusterTime = v;
@@ -502,6 +507,29 @@ export class SubtitleScanner {
 
 // ---- cue text ----
 
+/** Longest cue kept, in bytes: a subtitle line is a sentence or two. */
+export const MAX_CUE_BYTES = 4096;
+
+/** zlib-inflate, stopping once `limit` bytes are out (no decompression bombs). */
+async function inflateCapped(data: Uint8Array, limit: number): Promise<Uint8Array> {
+  const reader = new Blob([new Uint8Array(data)]).stream()
+    .pipeThrough(new DecompressionStream("deflate")).getReader();
+  const out = new Uint8Array(limit);
+  let n = 0;
+  try {
+    while (n < limit) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const take = Math.min(value.length, limit - n);
+      out.set(value.subarray(0, take), n);
+      n += take;
+    }
+  } finally {
+    reader.cancel().catch(() => {});
+  }
+  return out.subarray(0, n);
+}
+
 /**
  * Turn a raw block into cue text for the track's codec. Async because zlib
  * content compression is undone with DecompressionStream.
@@ -513,12 +541,9 @@ export async function cueText(track: SubtitleTrack, data: Uint8Array): Promise<s
     bytes.set(track.compression.settings);
     bytes.set(data, track.compression.settings.length);
   } else if (track.compression?.algo === 0) {
-    const stream = new Blob([new Uint8Array(data)]).stream().pipeThrough(
-      new DecompressionStream("deflate"),
-    );
-    bytes = new Uint8Array(await new Response(stream).arrayBuffer());
+    bytes = await inflateCapped(data, MAX_CUE_BYTES);
   }
-  let text = utf8.decode(bytes);
+  let text = utf8.decode(bytes.subarray(0, MAX_CUE_BYTES));
   if (track.codec === "S_TEXT/ASS" || track.codec === "S_TEXT/SSA") {
     // ReadOrder, Layer, Style, Name, MarginL, MarginR, MarginV, Effect, Text
     const parts = text.split(",");
