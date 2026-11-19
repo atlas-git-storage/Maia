@@ -13,12 +13,12 @@
 import type { Config } from "./config.ts";
 import { createGithubClient } from "./github.ts";
 import { Vault } from "./vault.ts";
-import { rangeStream } from "./reconstruct.ts";
+import { planRange, rangeStream } from "./reconstruct.ts";
 import { parseRange } from "./range.ts";
 import { contentType } from "./mime.ts";
 import { decodeSegment, dirExists, listDir, normalizePath } from "./tree.ts";
 import { COOKIE_NAME, type Handler, tokensEqual, withAuth } from "./auth.ts";
-import { HttpError } from "./errors.ts";
+import { HttpError, NotFoundError } from "./errors.ts";
 import { renderSnapshotList } from "./views/snapshots.ts";
 import { renderListing } from "./views/listing.ts";
 
@@ -29,7 +29,10 @@ export function buildHandler(config: Config): Deno.ServeHandler {
     vaultId: config.vaultId,
     token: config.githubToken,
   });
-  return buildHandlerWithVault(config.authToken, new Vault(client));
+  const sealing = config.vaultSecret
+    ? { vaultId: config.vaultId, secret: config.vaultSecret }
+    : undefined;
+  return buildHandlerWithVault(config.authToken, new Vault(client, sealing));
 }
 
 /** Build the handler around an already-constructed Vault (used by tests). */
@@ -142,8 +145,8 @@ async function route(vault: Vault, req: Request): Promise<Response> {
   // File request: but the path might actually be a directory (no trailing /).
   // If it's a directory, redirect to the trailing-slash form.
   const asDirPrefix = path + "/";
-  const isFile = manifest.entries.some((e) => e.p === path);
-  if (!isFile && dirExists(manifest.entries, asDirPrefix)) {
+  const entry = await vault.findEntry(snap, path);
+  if (!entry && dirExists(manifest.entries, asDirPrefix)) {
     // Safe from header (CRLF) injection: `url` is a parsed URL, so pathname and
     // search are already percent-encoded (control chars cannot appear raw).
     const loc = url.pathname.replace(/\/?$/, "/") + url.search;
@@ -155,17 +158,17 @@ async function route(vault: Vault, req: Request): Promise<Response> {
     });
   }
 
-  const entry = await vault.resolveEntry(snap, path);
-  return streamFile(vault, req, entry.c, entry.s, contentType(path));
+  if (!entry) throw new NotFoundError(`path '${path}' not found in snapshot`);
+  return await streamFile(vault, req, entry.c, entry.s, contentType(path));
 }
 
-function streamFile(
+async function streamFile(
   vault: Vault,
   req: Request,
   chunks: import("./types.ts").ChunkRef[],
   size: number,
   ctype: string,
-): Response {
+): Promise<Response> {
   const range = parseRange(req.headers.get("range"), size);
 
   const baseHeaders: Record<string, string> = {
@@ -206,7 +209,8 @@ function streamFile(
     return new Response(null, { status, headers });
   }
 
-  return new Response(rangeStream(vault, chunks, start, end), { status, headers });
+  const pieces = await planRange(vault, chunks, size, start, end);
+  return new Response(rangeStream(vault, pieces), { status, headers });
 }
 
 // ---- response helpers ----

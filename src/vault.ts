@@ -2,28 +2,64 @@
  * Vault orchestration: ties the GitHub client, chunk index, and parsers into
  * the read operations the server needs. Owns the caches:
  *   - ROOT doc: single value, short TTL (new snapshots appear without redeploy).
- *   - manifest: per snapshot id, process-life (immutable per id).
+ *   - manifest: per snapshot id, process-life (immutable per id), with a
+ *     path -> entry map so per-request lookups (every video Range request)
+ *     are O(1).
+ *   - decrypted chunks: a small byte-bounded LRU shared across requests, plus
+ *     in-flight de-duplication. Video players fire several overlapping Range
+ *     requests for the same region (probe, moov atom, resume after seek); each
+ *     would otherwise re-download and re-decrypt the same multi-MB chunk.
  */
 
 import type { GithubClient } from "./github.ts";
-import { ChunkIndex } from "./chunkindex.ts";
+import { type AssetInfo, ChunkIndex } from "./chunkindex.ts";
 import type { ChunkRef, Manifest, ManifestEntry, RootDoc, Snapshot } from "./types.ts";
 import { parseManifestPointer, parseRootBody } from "./rootdoc.ts";
 import { decodeManifest } from "./manifest.ts";
-import { bytesToHex, decryptChunk, hexToCid, hexToKey } from "./crypto.ts";
+import {
+  bytesToHex,
+  decryptChunk,
+  hexToCid,
+  hexToKey,
+  openPointer,
+  type PointerSealing,
+  TAG_LEN,
+} from "./crypto.ts";
 import { BadVaultError, NotFoundError } from "./errors.ts";
 
 const ROOT_TTL_MS = 60_000;
+/**
+ * Byte budget for cached decrypted chunks. Sized to hold a few default-size
+ * (~20 MiB avg) atlas chunks while staying well inside a 512 MB instance.
+ */
+const CHUNK_CACHE_BYTES = 128 * 1024 * 1024;
+/** atlas's ROOT field name for snapshot manifest pointers (`_POINTER_FIELD`). */
+const SNAPSHOT_POINTER_FIELD = "snapshot-manifest";
+
+interface LoadedManifest {
+  manifest: Manifest;
+  byPath: Map<string, ManifestEntry>;
+}
 
 export class Vault {
   #client: GithubClient;
   #index: ChunkIndex;
+  #sealing: PointerSealing | undefined;
   #root: { doc: RootDoc; at: number } | null = null;
-  #manifests = new Map<string, Manifest>();
+  #manifests = new Map<string, Promise<LoadedManifest>>();
+  /** cid hex -> plaintext; Map insertion order is the LRU order. */
+  #chunkCache = new Map<string, Uint8Array>();
+  #chunkCacheBytes = 0;
+  #inflight = new Map<string, Promise<Uint8Array>>();
 
-  constructor(client: GithubClient) {
+  /**
+   * `sealing` opens the sealed ROOT pointers written by atlas >= 0.2.0. Without
+   * it, only vaults with legacy (plaintext) pointers can be read.
+   */
+  constructor(client: GithubClient, sealing?: PointerSealing) {
     this.#client = client;
     this.#index = new ChunkIndex(client);
+    this.#sealing = sealing;
   }
 
   /** Load the ROOT doc, using a short TTL cache. */
@@ -77,45 +113,99 @@ export class Vault {
 
   /** Load and cache a snapshot's manifest (immutable per snapshot id). */
   async loadManifest(snapshot: Snapshot): Promise<Manifest> {
-    const cached = this.#manifests.get(snapshot.id);
-    if (cached) return cached;
+    return (await this.#loadManifest(snapshot)).manifest;
+  }
 
-    const refs = parseManifestPointer(snapshot.manifest);
-    const parts: Uint8Array[] = [];
-    for (const ref of refs) {
-      // Validate the cid hex (length-checks), then look it up by its hex form.
-      const cid = hexToCid(ref.cidHex);
-      const asset = await this.#fetchAsset(bytesToHex(cid));
-      parts.push(decryptChunk(hexToKey(ref.keyHex), asset));
-    }
-    const manifest = decodeManifest(concat(parts));
-    this.#manifests.set(snapshot.id, manifest);
-    return manifest;
+  /** Find a file entry in a snapshot by its relative path, or undefined. */
+  async findEntry(snapshot: Snapshot, path: string): Promise<ManifestEntry | undefined> {
+    return (await this.#loadManifest(snapshot)).byPath.get(path);
   }
 
   /** Find a file entry in a snapshot by its relative path. */
   async resolveEntry(snapshot: Snapshot, path: string): Promise<ManifestEntry> {
-    const manifest = await this.loadManifest(snapshot);
-    const entry = manifest.entries.find((e) => e.p === path);
+    const entry = await this.findEntry(snapshot, path);
     if (!entry) throw new NotFoundError(`path '${path}' not found in snapshot`);
     return entry;
   }
 
+  /** Plaintext length of a file chunk, from its asset size — no download. */
+  async chunkLength(ref: ChunkRef): Promise<number> {
+    const { size } = await this.#asset(bytesToHex(ref.cid));
+    if (size < TAG_LEN) throw new BadVaultError(`chunk asset is ${size} bytes, below the tag size`);
+    return size - TAG_LEN;
+  }
+
   /**
-   * Fetch + decrypt one of a file's chunks (raw-bytes ref). Used by the range
-   * streamer. Kept on the Vault so it shares the chunk index + client.
+   * Fetch + decrypt one of a file's chunks (raw-bytes ref). Served from the
+   * shared chunk cache when possible; concurrent reads of one chunk share a
+   * single download.
    */
-  async readChunk(ref: ChunkRef): Promise<Uint8Array> {
-    const asset = await this.#fetchAsset(bytesToHex(ref.cid));
-    return decryptChunk(ref.key, asset);
+  readChunk(ref: ChunkRef): Promise<Uint8Array> {
+    const cidHex = bytesToHex(ref.cid);
+    const cached = this.#chunkCache.get(cidHex);
+    if (cached) {
+      // Refresh LRU position.
+      this.#chunkCache.delete(cidHex);
+      this.#chunkCache.set(cidHex, cached);
+      return Promise.resolve(cached);
+    }
+    const pending = this.#inflight.get(cidHex);
+    if (pending) return pending;
+    const p = this.#fetchAsset(cidHex)
+      .then((asset) => {
+        const pt = decryptChunk(ref.key, asset);
+        this.#cachePut(cidHex, pt);
+        return pt;
+      })
+      .finally(() => this.#inflight.delete(cidHex));
+    this.#inflight.set(cidHex, p);
+    return p;
+  }
+
+  #loadManifest(snapshot: Snapshot): Promise<LoadedManifest> {
+    const cached = this.#manifests.get(snapshot.id);
+    if (cached) return cached;
+    const p = this.#fetchManifest(snapshot);
+    this.#manifests.set(snapshot.id, p);
+    // Don't pin a failure (transient GitHub error) for the process lifetime.
+    p.catch(() => this.#manifests.delete(snapshot.id));
+    return p;
+  }
+
+  async #fetchManifest(snapshot: Snapshot): Promise<LoadedManifest> {
+    const pointer = openPointer(this.#sealing, snapshot.manifest, SNAPSHOT_POINTER_FIELD);
+    const refs = parseManifestPointer(pointer);
+    const parts = await Promise.all(refs.map(async (ref) => {
+      // Validate the cid hex (length-checks), then look it up by its hex form.
+      const cid = hexToCid(ref.cidHex);
+      const key = hexToKey(ref.keyHex);
+      return decryptChunk(key, await this.#fetchAsset(bytesToHex(cid)));
+    }));
+    const manifest = decodeManifest(concat(parts));
+    return { manifest, byPath: new Map(manifest.entries.map((e) => [e.p, e])) };
+  }
+
+  #cachePut(cidHex: string, pt: Uint8Array): void {
+    if (pt.length > CHUNK_CACHE_BYTES) return;
+    this.#chunkCache.set(cidHex, pt);
+    this.#chunkCacheBytes += pt.length;
+    for (const [k, v] of this.#chunkCache) {
+      if (this.#chunkCacheBytes <= CHUNK_CACHE_BYTES) break;
+      this.#chunkCache.delete(k);
+      this.#chunkCacheBytes -= v.length;
+    }
+  }
+
+  async #asset(cidHex: string): Promise<AssetInfo> {
+    const asset = await this.#index.lookup(cidHex);
+    if (asset === undefined) {
+      throw new NotFoundError(`chunk ${cidHex} not found in vault releases`);
+    }
+    return asset;
   }
 
   async #fetchAsset(cidHex: string): Promise<Uint8Array> {
-    const assetId = await this.#index.assetId(cidHex);
-    if (assetId === undefined) {
-      throw new NotFoundError(`chunk ${cidHex} not found in vault releases`);
-    }
-    return await this.#client.downloadAsset(assetId);
+    return await this.#client.downloadAsset((await this.#asset(cidHex)).id);
   }
 }
 

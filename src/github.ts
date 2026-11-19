@@ -21,6 +21,12 @@ export interface ReleaseAsset {
 export interface Release {
   id: number;
   tag_name: string;
+  /**
+   * True iff the releases listing embedded an EMPTY asset list, which is
+   * conclusive (no assets) — the indexer can skip listing it. A non-empty
+   * embedded list may be truncated, so those are always listed exactly.
+   */
+  empty: boolean;
 }
 
 export interface GithubClient {
@@ -84,11 +90,17 @@ export function createGithubClient(cfg: GithubConfig): GithubClient {
       const prefix = `atlas-chunk-${vaultId}-`;
       const out: Release[] = [];
       for (let page = 1;; page++) {
-        const releases = await apiJson<Release[]>(
+        const releases = await apiJson<Array<{ id: number; tag_name: string; assets?: unknown[] }>>(
           `/repos/${owner}/${repo}/releases?per_page=100&page=${page}`,
         );
         for (const r of releases) {
-          if (r.tag_name.startsWith(prefix)) out.push({ id: r.id, tag_name: r.tag_name });
+          if (r.tag_name.startsWith(prefix)) {
+            out.push({
+              id: r.id,
+              tag_name: r.tag_name,
+              empty: Array.isArray(r.assets) && r.assets.length === 0,
+            });
+          }
         }
         if (releases.length < 100) break;
       }
