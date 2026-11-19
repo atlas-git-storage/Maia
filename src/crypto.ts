@@ -16,7 +16,7 @@ import { hkdf } from "@noble/hashes/hkdf.js";
 import { sha256 } from "@noble/hashes/sha2.js";
 import { decodeBase64 } from "@std/encoding/base64";
 import { decodeHex, encodeHex } from "@std/encoding/hex";
-import { BadVaultError, HttpError } from "./errors.ts";
+import { BadVaultError, ConfigError } from "./errors.ts";
 
 const KEY_LEN = 32;
 const CHUNK_ID_LEN = 32;
@@ -136,8 +136,7 @@ export function openPointer(
 ): string {
   if (!isSealedPointer(value)) return value;
   if (!sealing) {
-    throw new HttpError(
-      500,
+    throw new ConfigError(
       "vault uses sealed ROOT pointers (atlas >= 0.2.0); set ATLAS_VAULT_SECRET",
     );
   }

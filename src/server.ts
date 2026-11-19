@@ -18,7 +18,7 @@ import { parseRange } from "./range.ts";
 import { contentType } from "./mime.ts";
 import { decodeSegment, dirExists, listDir, normalizePath } from "./tree.ts";
 import { COOKIE_NAME, type Handler, tokensEqual, withAuth } from "./auth.ts";
-import { HttpError, NotFoundError } from "./errors.ts";
+import { HttpError, NotFoundError, UpstreamError } from "./errors.ts";
 import { renderSnapshotList } from "./views/snapshots.ts";
 import { renderListing } from "./views/listing.ts";
 
@@ -42,15 +42,15 @@ export function buildHandlerWithVault(authToken: string, vault: Vault): Deno.Ser
       return text(405, "Method Not Allowed");
     }
     try {
-      return await route(vault, req);
+      return await route(vault, req, authToken);
     } catch (e) {
       if (e instanceof HttpError) {
-        // 4xx messages are safe + useful to the client. 5xx messages can carry
-        // upstream GitHub error snippets and owner/repo paths — log those
-        // server-side and return a generic body so nothing internal leaks.
-        if (e.status >= 500) {
-          console.error("upstream/vault error:", e.message);
-          return text(e.status, "Bad Gateway");
+        // Upstream messages can carry GitHub error snippets and owner/repo
+        // paths — log those server-side and return a generic body. Vault and
+        // config errors describe the problem (and its fix) without secrets.
+        if (e.status >= 500) console.error("vault error:", e.message);
+        if (e instanceof UpstreamError) {
+          return text(e.status, "Bad Gateway (GitHub request failed)");
         }
         return text(e.status, e.message);
       }
@@ -69,11 +69,33 @@ export function buildHandlerWithVault(authToken: string, vault: Vault): Deno.Ser
  * tokenless navigations/asset loads work. We set it even if a cookie is already
  * present, so a stale cookie (after an AUTH_TOKEN rotation) is refreshed by
  * visiting a fresh `?token=` link rather than wedging the browser at 401.
+ *
+ * A browser navigation is answered with a 303 to the same URL minus `token`,
+ * so the secret never stays in the address bar or history. Other clients (VLC,
+ * curl) can't hold a cookie, so they are served directly at the token URL.
  */
 function withCookieBootstrap(authToken: string, guarded: Handler): Handler {
+  const cookie = `${COOKIE_NAME}=${
+    encodeURIComponent(authToken)
+  }; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=31536000`;
   return async (req) => {
     const url = new URL(req.url);
     const qpToken = url.searchParams.get("token");
+    if (
+      qpToken !== null && req.method === "GET" && isBrowserNavigation(req) &&
+      await tokensEqual(qpToken, authToken)
+    ) {
+      url.searchParams.delete("token");
+      return new Response(null, {
+        status: 303,
+        headers: {
+          "Location": url.pathname + url.search,
+          "Set-Cookie": cookie,
+          "Cache-Control": "no-store",
+          "Referrer-Policy": "no-referrer",
+        },
+      });
+    }
     const res = await guarded(req);
     // Set the cookie only when the guard served real content (2xx) and the
     // request's ?token is the valid token (verified CONSTANT-TIME, never with
@@ -84,23 +106,26 @@ function withCookieBootstrap(authToken: string, guarded: Handler): Handler {
       await tokensEqual(qpToken, authToken)
     ) {
       const headers = new Headers(res.headers);
-      headers.append(
-        "Set-Cookie",
-        `${COOKIE_NAME}=${
-          encodeURIComponent(authToken)
-        }; HttpOnly; Secure; SameSite=Strict; Path=/; Max-Age=31536000`,
-      );
+      headers.append("Set-Cookie", cookie);
       return new Response(res.body, { status: res.status, headers });
     }
     return res;
   };
 }
 
-async function route(vault: Vault, req: Request): Promise<Response> {
+/**
+ * A top-level browser page load. Browsers send `Sec-Fetch-Mode: navigate`;
+ * older ones without Fetch Metadata are recognised by asking for HTML. VLC and
+ * curl send neither.
+ */
+function isBrowserNavigation(req: Request): boolean {
+  const mode = req.headers.get("sec-fetch-mode");
+  if (mode !== null) return mode === "navigate";
+  return (req.headers.get("accept") ?? "").includes("text/html");
+}
+
+async function route(vault: Vault, req: Request, authToken: string): Promise<Response> {
   const url = new URL(req.url);
-  const tokenQuery = url.searchParams.has("token")
-    ? `?token=${encodeURIComponent(url.searchParams.get("token")!)}`
-    : "";
 
   // Split path into segments, dropping empties.
   const rawSegments = url.pathname.split("/").filter((s) => s.length > 0);
@@ -111,7 +136,7 @@ async function route(vault: Vault, req: Request): Promise<Response> {
     if (wantsJson(req)) {
       return json(200, snaps.map((s) => ({ id: s.id, name: s.name, created: s.created })));
     }
-    return html(200, renderSnapshotList(snaps, tokenQuery));
+    return html(200, renderSnapshotList(snaps));
   }
 
   // First segment is the snapshot selector.
@@ -139,7 +164,16 @@ async function route(vault: Vault, req: Request): Promise<Response> {
         children,
       });
     }
-    return html(200, renderListing(snap, prefix, children, tokenQuery, url.origin));
+    return html(
+      200,
+      renderListing(
+        snap,
+        prefix,
+        children,
+        `?token=${encodeURIComponent(authToken)}`,
+        url.origin,
+      ),
+    );
   }
 
   // File request: but the path might actually be a directory (no trailing /).

@@ -22,14 +22,17 @@ function humanSize(n: number): string {
  * @param snap     the snapshot
  * @param dir      current directory prefix ("" = root, else "a/b/")
  * @param children immediate children of `dir`
- * @param tokenQuery "?token=..." (or "") to preserve auth in links/copy-URL
+ * @param copyQuery "?token=..." appended ONLY to video copy-URLs (VLC has no
+ *                  cookie). Navigation links stay tokenless: the browser
+ *                  authenticates with the cookie, so the token never lands in
+ *                  history.
  * @param origin   absolute origin (e.g. https://maia.deno.dev) for copy-URL
  */
 export function renderListing(
   snap: Snapshot,
   dir: string,
   children: DirChild[],
-  tokenQuery: string,
+  copyQuery: string,
   origin: string,
 ): string {
   const segId = encodeURIComponent(snap.id);
@@ -37,7 +40,7 @@ export function renderListing(
   // Build a link to a child path within this snapshot.
   const linkTo = (relPath: string): string => {
     const enc = relPath.split("/").map(encodeURIComponent).join("/");
-    return `/${segId}/${enc}${tokenQuery}`;
+    return `/${segId}/${enc}`;
   };
 
   const rows = children.map((c) => {
@@ -52,7 +55,7 @@ export function renderListing(
     let action = "";
     if (isVideo(c.path!)) {
       // Absolute, token-bearing URL for VLC; copied via a tiny inline handler.
-      const abs = origin + linkTo(c.path!);
+      const abs = origin + linkTo(c.path!) + copyQuery;
       action = `<button type="button" data-url="${
         escapeAttr(abs)
       }" onclick="copyUrl(this)">copy URL</button>`;
@@ -68,7 +71,7 @@ ${action}
 
   const body = `<h1>${escapeHtml(snap.name)}</h1>
 ${crumbs}
-<p>${upLink(snap, dir, tokenQuery)}</p>
+<p>${upLink(snap, dir)}</p>
 ${children.length === 0 ? "<p>(empty)</p>" : `<ul>\n${rows}\n</ul>`}
 <script>
 function copyUrl(btn){
@@ -79,13 +82,13 @@ function copyUrl(btn){
   return htmlShell(`maia — ${snap.name}`, body);
 }
 
-function upLink(snap: Snapshot, dir: string, tokenQuery: string): string {
+function upLink(snap: Snapshot, dir: string): string {
   const segId = encodeURIComponent(snap.id);
   if (dir === "") {
-    return `<a href="${escapeAttr("/" + tokenQuery)}">← snapshots</a>`;
+    return `<a href="${escapeAttr("/")}">← snapshots</a>`;
   }
   const parent = dir.replace(/[^/]+\/$/, ""); // strip last segment
   const enc = parent.split("/").filter(Boolean).map(encodeURIComponent).join("/");
-  const href = `/${segId}/${enc ? enc + "/" : ""}${tokenQuery}`;
+  const href = `/${segId}/${enc ? enc + "/" : ""}`;
   return `<a href="${escapeAttr(href)}">← up</a>`;
 }

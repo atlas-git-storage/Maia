@@ -4,10 +4,10 @@ import type { Snapshot } from "../types.ts";
 import { htmlShell } from "./layout.ts";
 import { escapeAttr, escapeHtml } from "./escape.ts";
 
-export function renderSnapshotList(snapshots: Snapshot[], tokenQuery: string): string {
+export function renderSnapshotList(snapshots: Snapshot[]): string {
   // Newest first for display (atlas stores newest-last).
   const items = [...snapshots].reverse().map((s) => {
-    const href = `/${encodeURIComponent(s.id)}/${tokenQuery}`;
+    const href = `/${encodeURIComponent(s.id)}/`;
     return `<li class="dir">
 <a class="name" href="${escapeAttr(href)}">${escapeHtml(s.name)}</a>
 <span class="meta">${escapeHtml(s.created)}</span>
