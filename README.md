@@ -58,7 +58,8 @@ Generate `AUTH_TOKEN` with e.g. `openssl rand -hex 32`.
 ## Auth
 
 `GET /healthz` returns `ok` without auth (no vault or GitHub access) — point Render's health check
-at it. Every other endpoint is gated. A client may present `AUTH_TOKEN` three ways (preferred first):
+at it. Every other endpoint is gated. A client may present `AUTH_TOKEN` three ways (preferred
+first):
 
 1. `Authorization: Bearer <token>` — for curl/VLC.
 2. `Cookie: maia_token=<token>` — set automatically when you open any `?token=<token>` URL in a
@@ -73,11 +74,11 @@ Tapping a video opens a player page (`/<snap>/<video>?play`) with a **Subtitles*
 
 **In video** — text subtitle tracks embedded in MKV/WebM (SRT, ASS, WebVTT). Browsers drop these
 tracks, so Maia picks them up itself: subtitle lines sit between the video/audio data in the file,
-and as Maia streams the video to the browser it scans those bytes for them (only element
-headers are read; video payloads are skipped). The page polls `?subtitles` every 2 s while
-playing. The browser buffers ahead, so lines arrive before they're due; after a seek they resume
-from the new position. Nothing extra is downloaded from GitHub. Image tracks (PGS/VobSub) are
-listed but need VLC; ASS styling is dropped.
+and as Maia streams the video to the browser it scans those bytes for them (only element headers are
+read; video payloads are skipped). The page polls `?subtitles` every 2 s while playing. The browser
+buffers ahead, so lines arrive before they're due; after a seek they resume from the new position.
+Nothing extra is downloaded from GitHub. Image tracks (PGS/VobSub) are listed but need VLC; ASS
+styling is dropped.
 
 **Files in the vault** — matched by name:
 
